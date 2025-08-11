@@ -1,7 +1,6 @@
 package mock
 
 import (
-	"context"
 	"log"
 	"sync"
 	"time"
@@ -34,8 +33,6 @@ func RedisLimiterMock() {
 	passCh := make(chan int, workerCount)
 	blockCh := make(chan int, workerCount)
 
-	ctx := context.Background()
-
 	st := time.Now()
 	for w := 0; w < workerCount; w++ {
 		wg.Add(1)
@@ -46,7 +43,7 @@ func RedisLimiterMock() {
 			pass, block := 0, 0
 			for i := 0; i < requestsPerWorker; i++ {
 				<-ticker.C
-				allowed, err := rl.Allow(ctx, "user:42")
+				allowed, err := rl.Allow("user:42")
 				if err != nil {
 					log.Printf("[工人%d] 限流器报错了: %v", workerID, err)
 					continue

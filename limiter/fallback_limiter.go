@@ -8,83 +8,82 @@ import (
 	"time"
 )
 
-// Limiter is the interface that all limiters should implement.
-// This makes them interchangeable, which is the whole fucking point.
-type Limiter interface {
-	Allow(ctx context.Context, bizKey string) (bool, error)
-	AllowN(ctx context.Context, bizKey string, n float64) (bool, error)
-}
-
-// FallbackLimiter provides a fallback mechanism. It uses the primary limiter by default
-// and switches to the fallback limiter if the primary is down.
+// FallbackLimiter provides a fallback mechanism. It uses a primary limiter and falls back to a secondary one if the primary fails.
 type FallbackLimiter struct {
 	primary       Limiter
-	fallback      Limiter
+	secondary     Limiter
 	isPrimaryDown atomic.Bool
-	cancel        context.CancelFunc
 }
 
 // NewFallbackLimiter creates a new FallbackLimiter.
-// It also starts a background goroutine to check the health of the primary limiter.
-func NewFallbackLimiter(primary Limiter, fallback Limiter) (*FallbackLimiter, error) {
+func NewFallbackLimiter(primary, secondary Limiter) (*FallbackLimiter, error) {
 	if primary == nil {
 		return nil, fmt.Errorf("primary limiter can't be nil")
 	}
-	if fallback == nil {
-		return nil, fmt.Errorf("fallback limiter can't be nil")
+	if secondary == nil {
+		return nil, fmt.Errorf("secondary limiter can't be nil")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	fl := &FallbackLimiter{
-		primary:  primary,
-		fallback: fallback,
-		cancel:   cancel,
-	}
-	fl.isPrimaryDown.Store(false)
+	fl := &FallbackLimiter{primary, secondary, atomic.Bool{}}
 
 	go fl.healthCheck(ctx)
 
 	return fl, nil
 }
 
-// AllowN checks if n tokens can be taken. It attempts to use the primary limiter first.
-// If the primary fails, it transparently switches to the fallback limiter.
-func (l *FallbackLimiter) AllowN(ctx context.Context, bizKey string, n float64) (bool, error) {
-	if l.isPrimaryDown.Load() {
-		return l.useFallback(ctx, bizKey, n)
-	}
+// Allow reports whether the event may happen now.
+func (l *FallbackLimiter) Allow(key string) (bool, error) {
+	return l.AllowN(key, 1)
+}
 
-	allowed, err := l.primary.AllowN(ctx, bizKey, n)
-	if err != nil {
-		log.Printf("FUCK! Primary limiter failed: %v. Switching to fallback.", err)
+// AllowN reports whether n events may happen at time now.
+func (l *FallbackLimiter) AllowN(key string, n int) (bool, error) {
+	allowed, err := l.primary.AllowN(key, n)
+	if err != nil || l.isPrimaryDown.Load() {
 		l.isPrimaryDown.Store(true)
-		return l.useFallback(ctx, bizKey, n)
+		log.Printf("primary limiter failed, falling back to secondary: %v", err)
+		return l.secondary.AllowN(key, n)
 	}
-
 	return allowed, nil
 }
 
-// Allow is a convenience method for AllowN(ctx, bizKey, 1).
-func (l *FallbackLimiter) Allow(ctx context.Context, bizKey string) (bool, error) {
-	return l.AllowN(ctx, bizKey, 1)
+// Reserve returns a Reservation that indicates how long the caller must wait before the next event can happen.
+func (l *FallbackLimiter) Reserve(key string) (*Reservation, error) {
+	return l.ReserveN(key, 1)
 }
 
-// useFallback is a helper to encapsulate the fallback logic.
-func (l *FallbackLimiter) useFallback(ctx context.Context, bizKey string, n float64) (bool, error) {
-	log.Println("Using fallback limiter.")
-	allowed, err := l.fallback.AllowN(ctx, bizKey, n)
-	if err != nil {
-		// If the fallback also fails, we're fucked.
-		log.Printf("SHIT! Fallback limiter also failed: %v", err)
-		return false, err
+// ReserveN returns a Reservation that indicates how long the caller must wait before n events can happen.
+func (l *FallbackLimiter) ReserveN(key string, n int) (*Reservation, error) {
+	r, err := l.primary.ReserveN(key, n)
+	if err != nil || l.isPrimaryDown.Load() {
+		l.isPrimaryDown.Store(true)
+		log.Printf("primary limiter reservation failed, falling back to secondary: %v", err)
+		return l.secondary.ReserveN(key, n)
 	}
-	return allowed, nil
+	return r, nil
+}
+
+// Wait is a shortcut for WaitN(ctx, key, 1).
+func (l *FallbackLimiter) Wait(ctx context.Context, key string) error {
+	return l.WaitN(ctx, key, 1)
+}
+
+// WaitN blocks until n events can be allowed.
+func (l *FallbackLimiter) WaitN(ctx context.Context, key string, n int) error {
+	err := l.primary.WaitN(ctx, key, n)
+	if err != nil || l.isPrimaryDown.Load() {
+		l.isPrimaryDown.Store(true)
+		log.Printf("primary limiter failed on WaitN, falling back to secondary: %v", err)
+		return l.secondary.WaitN(ctx, key, n)
+	}
+	return nil
 }
 
 // healthCheck periodically checks if the primary limiter has recovered.
 func (l *FallbackLimiter) healthCheck(ctx context.Context) {
-	// Don't spam the health check. Once every few seconds is enough.
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -96,18 +95,12 @@ func (l *FallbackLimiter) healthCheck(ctx context.Context) {
 			log.Println("Health checker shutting down.")
 			return
 		case <-ticker.C:
-			// Only check if we are currently in fallback mode.
-			if l.isPrimaryDown.Load() {
-				// Use a short timeout for the health check to avoid blocking for too long.
-				checkCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				// We use AllowN with 0 tokens to just check the connection without consuming tokens.
-				if _, err := l.primary.AllowN(checkCtx, "health_check", 0); err == nil {
-					log.Println("GOOD NEWS! Primary limiter has recovered. Switching back.")
-					l.isPrimaryDown.Store(false)
-				} else {
-					log.Printf("Primary limiter still down: %v", err)
-				}
-				cancel()
+			if allowed, err := l.primary.AllowN("health_check", 0); err != nil || !allowed {
+				log.Println("Primary limiter still down. Switching to secondary.")
+				l.isPrimaryDown.Store(true)
+			} else {
+				log.Println("Primary limiter is healthy.")
+				l.isPrimaryDown.Store(false)
 			}
 		}
 	}
@@ -116,5 +109,6 @@ func (l *FallbackLimiter) healthCheck(ctx context.Context) {
 // Close stops the health check goroutine.
 // You should call this when you're done with the limiter to avoid leaking goroutines.
 func (l *FallbackLimiter) Close() {
-	l.cancel()
+	// No explicit cancel needed for healthCheck as it's a background goroutine.
+	// If primary and secondary were managed by context, you'd cancel them here.
 }
