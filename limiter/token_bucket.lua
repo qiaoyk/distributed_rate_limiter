@@ -1,47 +1,52 @@
--- KEYS[1]: The unique key for the rate limiter instance.
--- ARGV[1]: The rate of token generation per second.
--- ARGV[2]: The capacity of the token bucket.
--- ARGV[3]: The current time as a Unix timestamp (float).
--- ARGV[4]: The number of tokens to consume.
+-- KEYS[1]: the key for the token bucket, e.g., "limiter:{user_id}"
+-- ARGV[1]: rate (tokens per second)
+-- ARGV[2]: capacity (bucket size)
+-- ARGV[3]: now (current timestamp in seconds with fractional part)
+-- ARGV[4]: n (number of tokens to consume)
+--
+-- Returns a table with three values:
+-- {
+--   1: allowed (1 for yes, 0 for no),
+--   2: tokens (the current number of tokens in the bucket),
+--   3: retry_after (the recommended time in seconds to wait before retrying, -1 if allowed)
+-- }
 
+local key = KEYS[1]
 local rate = tonumber(ARGV[1])
 local capacity = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
-local requested = tonumber(ARGV[4])
+local requested_tokens = tonumber(ARGV[4])
 
-local info = redis.call("HMGET", KEYS[1], "tokens", "ts")
-local tokens = tonumber(info[1])
-local last_ts = tonumber(info[2])
+local state = redis.call("HMGET", key, "tokens", "last_op")
+local tokens = tonumber(state[1])
+local last_op = tonumber(state[2])
 
--- Initialize if it's the first request.
-if tokens == nil or last_ts == nil then
+if tokens == nil or last_op == nil then
+  -- initialize the bucket.
   tokens = capacity
-  last_ts = now
+  last_op = now
 end
 
--- Refill the bucket with new tokens based on elapsed time.
-local elapsed = now - last_ts
+-- Refill tokens based on elapsed time.
+local elapsed = now - last_op
 if elapsed > 0 then
   tokens = math.min(capacity, tokens + elapsed * rate)
 end
 
 local allowed = 0
--- If there are enough tokens, consume them and mark as allowed.
-if tokens >= requested then
-  tokens = tokens - requested
+local retry_after = -1.0
+
+if tokens >= requested_tokens then
+  -- Enough tokens are available.
+  tokens = tokens - requested_tokens
   allowed = 1
+  redis.call("HMSET", key, "tokens", tokens, "last_op", now)
+else
+  -- Not enough tokens. Calculate how long to wait.
+  local needed = requested_tokens - tokens
+  retry_after = needed / rate
 end
 
--- Update the token count and timestamp in Redis.
-redis.call("HMSET", KEYS[1], "tokens", tokens, "ts", now)
-
--- Set a TTL on the key to prevent memory leaks from unused limiters.
--- A reasonable TTL is twice the time it takes to fill the bucket from empty, with a minimum.
-local ttl = math.ceil((capacity / rate) * 2)
-if ttl < 20 then
-    ttl = 20
-end
-redis.call("EXPIRE", KEYS[1], ttl)
-
-return allowed
+-- Convert numbers to strings to ensure consistent return types for parsing in Go.
+return { tostring(allowed), tostring(tokens), tostring(retry_after) }
 
