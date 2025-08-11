@@ -1,7 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"rate_limiter/mock"
+)
 
 func main() {
-	fmt.Println("Hello, World!")
+	mock.FallbackLimiterMock(true)
 }

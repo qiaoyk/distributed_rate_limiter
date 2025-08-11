@@ -5,7 +5,6 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/go-redis/redis/v8"
 )
@@ -15,16 +14,27 @@ var luaScript string
 
 // RedisLimiter is a distributed rate limiter based on the token bucket algorithm, using Redis and Lua script to ensure atomicity.
 type RedisLimiter struct {
-	client    *redis.Client
-	key       string  // This acts as a key prefix for namespacing.
-	rate      float64 // tokens per second
-	cap       float64 // bucket capacity
-	scriptSHA string
+	client *redis.Client
+	key    string  // This acts as a key prefix for namespacing.
+	rate   float64 // tokens per second
+	cap    float64 // bucket capacity
+	script *redis.Script
+	clock  Clock
+}
+
+// Option configures a RedisLimiter.
+type Option func(*RedisLimiter)
+
+// WithClock sets a custom clock for the limiter, useful for testing.
+func WithClock(c Clock) Option {
+	return func(l *RedisLimiter) {
+		l.clock = c
+	}
 }
 
 // NewRedisLimiter creates a new RedisLimiter.
 // It loads the Lua script into Redis and stores the SHA hash for future calls.
-func NewRedisLimiter(client *redis.Client, keyPrefix string, rate float64, capacity float64) (*RedisLimiter, error) {
+func NewRedisLimiter(client *redis.Client, keyPrefix string, rate float64, capacity float64, opts ...Option) (*RedisLimiter, error) {
 	if client == nil {
 		return nil, errors.New("redis client cannot be nil")
 	}
@@ -35,19 +45,26 @@ func NewRedisLimiter(client *redis.Client, keyPrefix string, rate float64, capac
 		return nil, errors.New("capacity and rate must be greater than 0")
 	}
 
-	// Load the script into Redis and get its SHA hash.
-	sha, err := client.ScriptLoad(context.Background(), luaScript).Result()
-	if err != nil {
+	script := redis.NewScript(luaScript)
+	// Pre-load the script on initialization for fail-fast behavior.
+	if err := script.Load(context.Background(), client).Err(); err != nil {
 		return nil, fmt.Errorf("failed to load lua script: %w", err)
 	}
 
-	return &RedisLimiter{
-		client:    client,
-		key:       keyPrefix,
-		rate:      rate,
-		cap:       capacity,
-		scriptSHA: sha,
-	}, nil
+	limiter := &RedisLimiter{
+		client: client,
+		key:    keyPrefix,
+		rate:   rate,
+		cap:    capacity,
+		script: script,
+		clock:  NewRealClock(),
+	}
+
+	for _, opt := range opts {
+		opt(limiter)
+	}
+
+	return limiter, nil
 }
 
 // Allow is a convenience method for AllowN(ctx, bizKey, 1).
@@ -62,20 +79,9 @@ func (l *RedisLimiter) AllowN(ctx context.Context, bizKey string, n float64) (bo
 		return false, errors.New("bizKey cannot be fucking empty")
 	}
 	fullKey := fmt.Sprintf("%s:%s", l.key, bizKey)
-	now := float64(time.Now().UnixNano()) / 1e9
+	now := float64(l.clock.Now().UnixNano()) / 1e9
 
-	result, err := l.client.EvalSha(ctx, l.scriptSHA, []string{fullKey}, l.rate, l.cap, now, n).Result()
-	if errors.Is(err, redis.Nil) {
-		// This can happen if Redis was flushed. We should reload the script.
-		sha, loadErr := l.client.ScriptLoad(ctx, luaScript).Result()
-		if loadErr != nil {
-			return false, fmt.Errorf("failed to reload lua script: %w", loadErr)
-		}
-		l.scriptSHA = sha
-		// Retry the call
-		result, err = l.client.EvalSha(ctx, l.scriptSHA, []string{fullKey}, l.rate, l.cap, now, n).Result()
-	}
-
+	result, err := l.script.Run(ctx, l.client, []string{fullKey}, l.rate, l.cap, now, n).Result()
 	if err != nil {
 		return false, fmt.Errorf("failed to execute lua script: %w", err)
 	}
