@@ -84,7 +84,7 @@ func (l *FallbackLimiter) WaitN(ctx context.Context, key string, n int) error {
 
 // healthCheck periodically checks if the primary limiter has recovered.
 func (l *FallbackLimiter) healthCheck(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	log.Println("Health checker started. Will check primary status periodically.")
@@ -106,9 +106,6 @@ func (l *FallbackLimiter) healthCheck(ctx context.Context) {
 	}
 }
 
-// Close stops the health check goroutine.
-// You should call this when you're done with the limiter to avoid leaking goroutines.
+// Close stops the health check goroutine. Plz call this method to avoid leaking goroutines.
 func (l *FallbackLimiter) Close() {
-	// No explicit cancel needed for healthCheck as it's a background goroutine.
-	// If primary and secondary were managed by context, you'd cancel them here.
 }

@@ -66,17 +66,19 @@ func FallbackLimiterMock(needMockRedisDown bool) {
 			}
 
 			for i := 0; i < requestsPerWorker; i++ {
+				startWait := time.Now()
 				err := fl.Wait(context.Background(), "user:wait_test")
+				waitTime := time.Since(startWait)
+
 				if err != nil {
 					log.Printf("[Worker %d] Wait returned an error: %v", workerID, err)
 				} else {
-					// 模拟业务处理：向 mock.log 写一行
 					f, ferr := os.OpenFile("mock.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 					if ferr != nil {
 						log.Printf("[Worker %d] Failed to open mock.log: %v", workerID, ferr)
 					} else {
 						ts := time.Now().Format("2006-01-02 15:04:05.000")
-						_, _ = fmt.Fprintf(f, "[%s] Worker %d processed request %d\n", ts, workerID, i+1)
+						_, _ = fmt.Fprintf(f, "[%s] Worker %d processed request %d, waited: %v\n", ts, workerID, i+1, waitTime)
 						_ = f.Close()
 					}
 				}

@@ -15,8 +15,7 @@ type bucketState struct {
 	lastOp time.Time
 }
 
-// MemoryLimiter is a thread-safe, in-memory rate limiter that can manage multiple buckets
-// distinguished by a business key (bizKey).
+// MemoryLimiter is a thread-safe, in-memory rate limiter. May be used for fallback logic of redis limiter.
 type MemoryLimiter struct {
 	lck     sync.Mutex
 	buckets map[string]*bucketState
@@ -26,7 +25,7 @@ type MemoryLimiter struct {
 }
 
 // NewMemoryLimiter creates a new MemoryLimiter.
-func NewMemoryLimiter(rate float64, cap float64) (*MemoryLimiter, error) {
+func NewMemoryLimiter(rate float64, cap float64, opts ...Option) (*MemoryLimiter, error) {
 	if rate <= 0 || cap <= 0 {
 		return nil, errors.New("rate and cap must be greater than 0")
 	}
@@ -117,16 +116,13 @@ func (l *MemoryLimiter) reserveN(now time.Time, key string, n int) *Reservation 
 	}
 	state.lastOp = now
 
-	// Check if we have enough tokens
 	tokensNeeded := float64(n)
 	delay := time.Duration(0)
 	if tokensNeeded > state.tokens {
-		// Not enough tokens, calculate wait time
 		needed := tokensNeeded - state.tokens
 		delay = time.Duration(needed/l.rate) * time.Second
 	}
 
-	// Consume tokens and return OK reservation
 	if delay == 0 {
 		state.tokens -= tokensNeeded
 	}
