@@ -5,10 +5,10 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/spf13/cast"
 )
 
 //go:embed token_bucket.lua
@@ -20,6 +20,7 @@ type RedisLimiter struct {
 	key    string // This acts as a key prefix for namespace.
 	rate   float64
 	cap    float64
+	ttl    time.Duration
 	script *redis.Script
 	clock  Clock
 }
@@ -35,7 +36,7 @@ func WithClock(c Clock) Option {
 }
 
 // NewRedisLimiter creates a new RedisLimiter.
-func NewRedisLimiter(client *redis.Client, keyPrefix string, rate float64, capacity float64, opts ...Option) (*RedisLimiter, error) {
+func NewRedisLimiter(client *redis.Client, keyPrefix string, rate float64, capacity float64, ttl time.Duration, opts ...Option) (*RedisLimiter, error) {
 	if client == nil {
 		return nil, errors.New("redis client cannot be nil")
 	}
@@ -45,6 +46,9 @@ func NewRedisLimiter(client *redis.Client, keyPrefix string, rate float64, capac
 	if capacity <= 0 || rate <= 0 {
 		return nil, errors.New("capacity and rate must be greater than 0")
 	}
+	if ttl <= 0 {
+		return nil, errors.New("ttl must be > 0")
+	}
 
 	// pre-load script
 	script := redis.NewScript(luaScript)
@@ -52,24 +56,29 @@ func NewRedisLimiter(client *redis.Client, keyPrefix string, rate float64, capac
 		return nil, fmt.Errorf("failed to load lua script: %w", err)
 	}
 
-	return &RedisLimiter{
+	limiter := &RedisLimiter{
 		client: client,
 		key:    keyPrefix,
 		rate:   rate,
 		cap:    capacity,
+		ttl:    ttl,
 		script: script,
 		clock:  NewRealClock(),
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(limiter)
+	}
+	return limiter, nil
 }
 
 // Allow is a shortcut for AllowN(key, 1).
-func (l *RedisLimiter) Allow(key string) (bool, error) {
-	return l.AllowN(key, 1)
+func (l *RedisLimiter) Allow(ctx context.Context, key string) (bool, error) {
+	return l.AllowN(ctx, key, 1)
 }
 
 // AllowN reports whether n events may happen at time now.
-func (l *RedisLimiter) AllowN(key string, n int) (bool, error) {
-	res, err := l.ReserveN(key, n)
+func (l *RedisLimiter) AllowN(ctx context.Context, key string, n int) (bool, error) {
+	res, err := l.ReserveN(ctx, key, n)
 	if err != nil {
 		return false, err
 	}
@@ -80,17 +89,17 @@ func (l *RedisLimiter) AllowN(key string, n int) (bool, error) {
 }
 
 // Reserve is a shortcut for ReserveN(key, 1).
-func (l *RedisLimiter) Reserve(key string) (*Reservation, error) {
-	return l.ReserveN(key, 1)
+func (l *RedisLimiter) Reserve(ctx context.Context, key string) (*Reservation, error) {
+	return l.ReserveN(ctx, key, 1)
 }
 
 // ReserveN returns a Reservation that indicates how long the caller must wait before n events happen.
-func (l *RedisLimiter) ReserveN(key string, n int) (*Reservation, error) {
+func (l *RedisLimiter) ReserveN(ctx context.Context, key string, n int) (*Reservation, error) {
 	if float64(n) > l.cap {
-		return &Reservation{ok: false, lim: l}, nil
+		return &Reservation{ok: false}, nil
 	}
 
-	res, err := l.reserveN(context.Background(), key, float64(n))
+	res, err := l.reserveN(ctx, key, float64(n))
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +111,6 @@ func (l *RedisLimiter) ReserveN(key string, n int) (*Reservation, error) {
 	return &Reservation{
 		ok:        true,
 		timeToAct: timeToAct,
-		lim:       l,
 		key:       key,
 		tokens:    n,
 	}, nil
@@ -115,7 +123,7 @@ func (l *RedisLimiter) Wait(ctx context.Context, key string) error {
 
 // WaitN blocks until n events can be allowed.
 func (l *RedisLimiter) WaitN(ctx context.Context, key string, n int) error {
-	res, err := l.ReserveN(key, n)
+	res, err := l.ReserveN(ctx, key, n)
 	if err != nil {
 		return err
 	}
@@ -127,6 +135,12 @@ func (l *RedisLimiter) WaitN(ctx context.Context, key string, n int) error {
 	delay := res.Delay()
 	if delay == 0 {
 		return nil
+	}
+
+	if dl, ok := ctx.Deadline(); ok {
+		if l.clock.Now().Add(delay).After(dl) {
+			return context.DeadlineExceeded
+		}
 	}
 
 	t := time.NewTimer(delay)
@@ -152,9 +166,12 @@ func (l *RedisLimiter) reserveN(ctx context.Context, bizKey string, n float64) (
 	fullKey := fmt.Sprintf("%s:%s", l.key, bizKey)
 	now := float64(l.clock.Now().UnixNano()) / 1e9
 
-	res, err := l.script.Run(ctx, l.client, []string{fullKey}, l.rate, l.cap, now, n).Result()
+	res, err := l.script.Run(ctx, l.client, []string{fullKey}, l.rate, l.cap, now, n, l.ttl.Seconds()).Result()
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute lua script: %w", err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: failed to execute lua script: %v", ErrPrimaryDown, err)
 	}
 
 	resSlice, ok := res.([]interface{})
@@ -162,26 +179,15 @@ func (l *RedisLimiter) reserveN(ctx context.Context, bizKey string, n float64) (
 		return nil, errors.New("unexpected result from redis script")
 	}
 
-	results := make([]string, 3)
-	for i := range resSlice {
-		s, ok := resSlice[i].(string)
-		if !ok {
-			return nil, fmt.Errorf("could not parse result from redis script at index %d", i)
-		}
-		results[i] = s
-	}
-
-	allowedInt, err := strconv.ParseInt(results[0], 10, 64)
+	allowedInt, err := cast.ToIntE(resSlice[0])
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse 'allowed': %w", err)
 	}
-
-	tokens, err := strconv.ParseFloat(results[1], 64)
+	tokens, err := cast.ToFloat64E(resSlice[1])
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse 'tokens': %w", err)
 	}
-
-	retryAfter, err := strconv.ParseFloat(results[2], 64)
+	retryAfter, err := cast.ToFloat64E(resSlice[2])
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse 'retry_after': %w", err)
 	}
@@ -191,4 +197,11 @@ func (l *RedisLimiter) reserveN(ctx context.Context, bizKey string, n float64) (
 		Tokens:     tokens,
 		RetryAfter: retryAfter,
 	}, nil
+}
+
+func (l *RedisLimiter) HealthCheck(ctx context.Context) error {
+	if err := l.client.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("%w: redis health check failed: %v", ErrPrimaryDown, err)
+	}
+	return nil
 }
