@@ -1,6 +1,7 @@
 package mock
 
 import (
+	"context"
 	"log"
 	"sync"
 	"time"
@@ -20,7 +21,7 @@ func RedisLimiterMock() {
 		}
 	}()
 
-	rl, err := limiter.NewRedisLimiter(rdb, "demo:limiter", 10, 10)
+	rl, err := limiter.NewRedisLimiter(rdb, "demo:limiter", 10, 10, time.Second*10)
 	if err != nil {
 		log.Fatalf("限流器都初始化失败 err: %v", err)
 	}
@@ -43,7 +44,7 @@ func RedisLimiterMock() {
 			pass, block := 0, 0
 			for i := 0; i < requestsPerWorker; i++ {
 				<-ticker.C
-				allowed, err := rl.Allow("user:42")
+				allowed, err := rl.Allow(context.Background(), "user:42")
 				if err != nil {
 					log.Printf("[工人%d] 限流器报错了: %v", workerID, err)
 					continue

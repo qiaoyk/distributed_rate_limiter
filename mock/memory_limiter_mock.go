@@ -1,6 +1,7 @@
 package mock
 
 import (
+	"context"
 	"log"
 	"sync"
 	"time"
@@ -33,7 +34,7 @@ func MemLimiterMock() {
 			pass, block := 0, 0
 			for i := 0; i < requestsPerWorker; i++ {
 				<-ticker.C
-				allowed, err := ml.Allow("user:42")
+				allowed, err := ml.Allow(context.Background(), "user:42")
 				if err != nil {
 					log.Printf("[工人%d] 限流器报错了: %v", workerID, err)
 					continue
