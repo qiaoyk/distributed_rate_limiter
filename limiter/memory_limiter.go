@@ -3,169 +3,104 @@ package limiter
 import (
 	"context"
 	"errors"
-	"fmt"
 	"hash/fnv"
 	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"golang.org/x/time/rate"
 )
 
 const numStripes = 256
 
-// bucketState holds the state for a single token bucket.
-type bucketState struct {
-	tokens float64
-	lastOp time.Time
-}
-
-// MemoryLimiter is a thread-safe, in-memory rate limiter. May be used for fallback logic of redis limiter.
-type MemoryLimiter struct {
+// StdMemoryLimiter is a thread-safe, in-memory rate limiter that uses the standard library's rate limiter.
+type StdMemoryLimiter struct {
 	locks   []sync.Mutex
-	buckets *lru.Cache[string, *bucketState] // map[string]*bucketState
-	rate    float64                          // rate of token generation per second
-	cap     float64                          // capacity of the bucket
-	clock   Clock
+	buckets *lru.Cache[string, *rate.Limiter]
+	rate    rate.Limit // rate of token generation per second
+	cap     int        // capacity of the bucket
 }
 
-// NewMemoryLimiter creates a new MemoryLimiter.
-func NewMemoryLimiter(rate float64, cap float64, opts ...MemoryOption) (*MemoryLimiter, error) {
-	if rate <= 0 || cap <= 0 {
+// NewStdMemoryLimiter creates a new StdMemoryLimiter.
+func NewStdMemoryLimiter(r float64, b int) (*StdMemoryLimiter, error) {
+	if r <= 0 || b <= 0 {
 		return nil, errors.New("rate and cap must be greater than 0")
 	}
 
-	cache, err := lru.New[string, *bucketState](maxKeys)
+	cache, err := lru.New[string, *rate.Limiter](maxKeys)
 	if err != nil {
 		return nil, err
 	}
 
-	l := &MemoryLimiter{
+	return &StdMemoryLimiter{
 		locks:   make([]sync.Mutex, numStripes),
 		buckets: cache,
-		rate:    rate,
-		cap:     cap,
-		clock:   NewRealClock(),
-	}
-	for _, opt := range opts {
-		opt(l)
-	}
-	return l, nil
+		rate:    rate.Limit(r),
+		cap:     b,
+	}, nil
 }
 
-func (l *MemoryLimiter) getLock(key string) *sync.Mutex {
+func (l *StdMemoryLimiter) getLock(key string) *sync.Mutex {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
 	return &l.locks[h.Sum32()%numStripes]
 }
 
 // Allow is a shortcut for AllowN(key, 1).
-func (l *MemoryLimiter) Allow(ctx context.Context, key string) (bool, error) {
+func (l *StdMemoryLimiter) Allow(ctx context.Context, key string) (bool, error) {
 	return l.AllowN(ctx, key, 1)
 }
 
 // AllowN reports whether n events may happen at time now.
-func (l *MemoryLimiter) AllowN(ctx context.Context, key string, n int) (bool, error) {
-	res, err := l.ReserveN(ctx, key, n)
-	if err != nil {
-		return false, err
-	}
-	if !res.OK() {
-		return false, nil
-	}
-	return res.Delay() == 0, nil
+func (l *StdMemoryLimiter) AllowN(ctx context.Context, key string, n int) (bool, error) {
+	return l.getLimiter(key).AllowN(time.Now(), n), nil
 }
 
 // Reserve is a shortcut for ReserveN(key, 1).
-func (l *MemoryLimiter) Reserve(ctx context.Context, key string) (*Reservation, error) {
+func (l *StdMemoryLimiter) Reserve(ctx context.Context, key string) (*Reservation, error) {
 	return l.ReserveN(ctx, key, 1)
 }
 
 // ReserveN returns a Reservation that indicates how long the caller must wait before n events happen.
-func (l *MemoryLimiter) ReserveN(ctx context.Context, key string, n int) (*Reservation, error) {
-	if float64(n) > l.cap {
+func (l *StdMemoryLimiter) ReserveN(ctx context.Context, key string, n int) (*Reservation, error) {
+	res := l.getLimiter(key).ReserveN(time.Now(), n)
+	if !res.OK() {
+		// This indicates that the request is impossible to satisfy, for example, if n > burst size.
 		return &Reservation{ok: false}, nil
 	}
-	return l.reserveN(l.clock.Now(), key, n), nil
+	return &Reservation{
+		ok:        true,
+		timeToAct: time.Now().Add(res.Delay()),
+		key:       key,
+		tokens:    n,
+	}, nil
 }
 
 // Wait is a shortcut for WaitN(ctx, key, 1).
-func (l *MemoryLimiter) Wait(ctx context.Context, key string) error {
+func (l *StdMemoryLimiter) Wait(ctx context.Context, key string) error {
 	return l.WaitN(ctx, key, 1)
 }
 
 // WaitN blocks until n events can be allowed.
-func (l *MemoryLimiter) WaitN(ctx context.Context, key string, n int) error {
-	r, err := l.ReserveN(ctx, key, n)
-	if err != nil {
-		return err
-	}
-	if !r.OK() {
-		return fmt.Errorf("rate: Wait(n=%d) exceeds limiter's capacity %v", n, l.cap)
-	}
-	delay := r.Delay()
-	if delay == 0 {
-		return nil
-	}
-
-	if dl, ok := ctx.Deadline(); ok {
-		if l.clock.Now().Add(delay).After(dl) {
-			return context.DeadlineExceeded
-		}
-	}
-
-	t := time.NewTimer(delay)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+func (l *StdMemoryLimiter) WaitN(ctx context.Context, key string, n int) error {
+	lim := l.getLimiter(key)
+	return lim.WaitN(ctx, n)
 }
 
 // HealthCheck checks the health of the limiter.
-func (l *MemoryLimiter) HealthCheck(_ context.Context) error {
+func (l *StdMemoryLimiter) HealthCheck(_ context.Context) error {
 	return nil // in-memory limiter is always healthy
 }
 
-func (l *MemoryLimiter) reserveN(now time.Time, key string, n int) *Reservation {
+func (l *StdMemoryLimiter) getLimiter(key string) *rate.Limiter {
 	mu := l.getLock(key)
 	mu.Lock()
 	defer mu.Unlock()
 
-	state, ok := l.buckets.Get(key)
+	lim, ok := l.buckets.Get(key)
 	if !ok {
-		state = &bucketState{
-			tokens: l.cap,
-			lastOp: now,
-		}
-		l.buckets.Add(key, state)
+		lim = rate.NewLimiter(l.rate, l.cap)
+		l.buckets.Add(key, lim)
 	}
-
-	// Refill tokens
-	elapsed := now.Sub(state.lastOp)
-	if elapsed > 0 {
-		state.tokens += l.rate * elapsed.Seconds()
-		if state.tokens > l.cap {
-			state.tokens = l.cap
-		}
-	}
-	state.lastOp = now
-
-	tokensNeeded := float64(n)
-	delay := time.Duration(0)
-	if tokensNeeded > state.tokens {
-		needed := tokensNeeded - state.tokens
-		delay = time.Duration(needed/l.rate) * time.Second
-	}
-
-	// Always subtract tokens, creating a "debt" if necessary.
-	state.tokens -= tokensNeeded
-
-	return &Reservation{
-		ok:        true,
-		timeToAct: now.Add(delay),
-		key:       key,
-		tokens:    n,
-	}
+	return lim
 }

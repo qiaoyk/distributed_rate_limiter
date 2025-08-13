@@ -5,5 +5,5 @@ import (
 )
 
 func main() {
-	mock.FallbackLimiterMock(true)
+	mock.FallbackLimiterMultiInstanceMock(true)
 }
