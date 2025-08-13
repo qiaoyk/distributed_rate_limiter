@@ -5,6 +5,8 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -22,16 +24,27 @@ type RedisLimiter struct {
 	cap    float64
 	ttl    time.Duration
 	script *redis.Script
-	clock  Clock
+
+	// For self-health-check
+	isDown                 atomic.Bool
+	cancel                 context.CancelFunc
+	wg                     sync.WaitGroup
+	healthCheckInterval    time.Duration
+	selfHealthCheckEnabled bool
 }
 
 // Option configures a RedisLimiter.
 type Option func(*RedisLimiter)
 
-// WithClock sets a custom clock for the limiter, for testing.
-func WithClock(c Clock) Option {
+// WithSelfHealthCheck enables a background health check goroutine for the RedisLimiter.
+func WithSelfHealthCheck(interval time.Duration) Option {
 	return func(l *RedisLimiter) {
-		l.clock = c
+		l.selfHealthCheckEnabled = true
+		if interval > 0 {
+			l.healthCheckInterval = interval
+		} else {
+			l.healthCheckInterval = 1 * time.Second // default
+		}
 	}
 }
 
@@ -63,12 +76,29 @@ func NewRedisLimiter(client *redis.Client, keyPrefix string, rate float64, capac
 		cap:    capacity,
 		ttl:    ttl,
 		script: script,
-		clock:  NewRealClock(),
 	}
 	for _, opt := range opts {
 		opt(limiter)
 	}
+
+	if limiter.selfHealthCheckEnabled {
+		var ctx context.Context
+		ctx, limiter.cancel = context.WithCancel(context.Background())
+		limiter.wg.Add(1)
+		go limiter.healthCheckLoop(ctx)
+	}
 	return limiter, nil
+}
+
+// Close stops the background health checker if it was started.
+func (l *RedisLimiter) Close() {
+	if l == nil {
+		return
+	}
+	if l.cancel != nil {
+		l.cancel()
+		l.wg.Wait()
+	}
 }
 
 // Allow is a shortcut for AllowN(key, 1).
@@ -78,6 +108,9 @@ func (l *RedisLimiter) Allow(ctx context.Context, key string) (bool, error) {
 
 // AllowN reports whether n events may happen at time now.
 func (l *RedisLimiter) AllowN(ctx context.Context, key string, n int) (bool, error) {
+	if l.selfHealthCheckEnabled && l.isDown.Load() {
+		return false, ErrPrimaryDown
+	}
 	res, err := l.ReserveN(ctx, key, n)
 	if err != nil {
 		return false, err
@@ -95,6 +128,9 @@ func (l *RedisLimiter) Reserve(ctx context.Context, key string) (*Reservation, e
 
 // ReserveN returns a Reservation that indicates how long the caller must wait before n events happen.
 func (l *RedisLimiter) ReserveN(ctx context.Context, key string, n int) (*Reservation, error) {
+	if l.selfHealthCheckEnabled && l.isDown.Load() {
+		return nil, ErrPrimaryDown
+	}
 	if float64(n) > l.cap {
 		return &Reservation{ok: false}, nil
 	}
@@ -105,7 +141,7 @@ func (l *RedisLimiter) ReserveN(ctx context.Context, key string, n int) (*Reserv
 	}
 
 	delay := time.Duration(res.RetryAfter * float64(time.Second))
-	now := l.clock.Now()
+	now := time.Now()
 	timeToAct := now.Add(delay)
 
 	return &Reservation{
@@ -123,6 +159,9 @@ func (l *RedisLimiter) Wait(ctx context.Context, key string) error {
 
 // WaitN blocks until n events can be allowed.
 func (l *RedisLimiter) WaitN(ctx context.Context, key string, n int) error {
+	if l.selfHealthCheckEnabled && l.isDown.Load() {
+		return ErrPrimaryDown
+	}
 	res, err := l.ReserveN(ctx, key, n)
 	if err != nil {
 		return err
@@ -138,7 +177,7 @@ func (l *RedisLimiter) WaitN(ctx context.Context, key string, n int) error {
 	}
 
 	if dl, ok := ctx.Deadline(); ok {
-		if l.clock.Now().Add(delay).After(dl) {
+		if time.Now().Add(delay).After(dl) {
 			return context.DeadlineExceeded
 		}
 	}
@@ -164,7 +203,7 @@ func (l *RedisLimiter) reserveN(ctx context.Context, bizKey string, n float64) (
 		return nil, errors.New("bizKey cannot be fucking empty")
 	}
 	fullKey := fmt.Sprintf("%s:%s", l.key, bizKey)
-	now := float64(l.clock.Now().UnixNano()) / 1e9
+	now := float64(time.Now().UnixNano()) / 1e9
 
 	res, err := l.script.Run(ctx, l.client, []string{fullKey}, l.rate, l.cap, now, n, l.ttl.Seconds()).Result()
 	if err != nil {
@@ -199,9 +238,45 @@ func (l *RedisLimiter) reserveN(ctx context.Context, bizKey string, n float64) (
 	}, nil
 }
 
+// HealthCheck checks the health of the limiter.
+// It does so by trying to perform a zero-cost reservation on a test key.
 func (l *RedisLimiter) HealthCheck(ctx context.Context) error {
-	if err := l.client.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("%w: redis health check failed: %v", ErrPrimaryDown, err)
+	// Use reserveN with n=0 as the health check.
+	_, err := l.reserveN(ctx, "health_check_key", 0)
+	if err != nil {
+		// The error from reserveN is already wrapped with ErrPrimaryDown
+		return fmt.Errorf("redis health check failed: %w", err)
 	}
 	return nil
+}
+
+// healthCheckLoop is the internal loop for self-monitoring.
+func (l *RedisLimiter) healthCheckLoop(ctx context.Context) {
+	defer l.wg.Done()
+	ticker := time.NewTicker(l.healthCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Perform health check
+			hctx, hcancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			err := l.HealthCheck(hctx)
+			hcancel()
+
+			if err != nil {
+				// Health check failed, mark as down if not already.
+				if !l.isDown.Load() {
+					l.isDown.Store(true)
+				}
+			} else {
+				// Health check succeeded, mark as up if it was down.
+				if l.isDown.Load() {
+					l.isDown.Store(false)
+				}
+			}
+		}
+	}
 }

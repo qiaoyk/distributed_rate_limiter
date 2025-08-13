@@ -14,16 +14,6 @@ const Inf = time.Duration(math.MaxInt64)
 
 const maxKeys = 10000
 
-// MemoryOption configures a MemoryLimiter.
-type MemoryOption func(*MemoryLimiter)
-
-// WithMemoryClock sets a custom clock for the memory limiter, for testing.
-func WithMemoryClock(c Clock) MemoryOption {
-	return func(l *MemoryLimiter) {
-		l.clock = c
-	}
-}
-
 // FallbackOption configures a FallbackLimiter.
 type FallbackOption func(*FallbackLimiter)
 
@@ -66,9 +56,4 @@ func (r *Reservation) Delay() time.Duration {
 		return 0
 	}
 	return delay
-}
-
-// Every returns a Limiter that allows events up to rate r and permits bursts of at most b tokens.
-func Every(rate float64, b int) (Limiter, error) {
-	return NewMemoryLimiter(rate, float64(b))
 }

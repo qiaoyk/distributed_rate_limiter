@@ -75,7 +75,7 @@ func FallbackLimiterMock(needMockRedisDown bool) {
 		log.Fatalf("Failed to create redis limiter: %v", err)
 	}
 
-	ml, err := limiter.NewMemoryLimiter(secondaryRate, secondaryCapacity)
+	ml, err := limiter.NewStdMemoryLimiter(secondaryRate, secondaryCapacity)
 	if err != nil {
 		log.Fatalf("Failed to create memory limiter: %v", err)
 	}
@@ -188,7 +188,7 @@ func FallbackLimiterMultiInstanceMock(needMockRedisDown bool) {
 				log.Printf("[Worker %d] Failed to create redis limiter: %v", workerID, err)
 				return
 			}
-			ml, err := limiter.NewMemoryLimiter(secondaryRate, secondaryCapacity)
+			ml, err := limiter.NewStdMemoryLimiter(secondaryRate, secondaryCapacity)
 			if err != nil {
 				log.Printf("[Worker %d] Failed to create memory limiter: %v", workerID, err)
 				return
